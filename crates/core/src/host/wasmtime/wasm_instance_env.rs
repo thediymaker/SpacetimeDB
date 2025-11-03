@@ -1,29 +1,20 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::num::NonZeroU32;
-use std::time::Instant;
-
+use super::{Mem, MemView, NullableMemOp, WasmError, WasmPointee, WasmPtr};
 use crate::database_logger::{BacktraceFrame, BacktraceProvider, ModuleBacktrace, Record};
 use crate::host::instance_env::{ChunkPool, InstanceEnv};
-use crate::host::wasm_common::instrumentation;
+use crate::host::wasm_common::instrumentation::{span, CallTimes};
 use crate::host::wasm_common::module_host_actor::ExecutionTimings;
-use crate::host::wasm_common::{
-    err_to_errno, instrumentation::CallTimes, AbiRuntimeError, RowIterIdx, RowIters, TimingSpan, TimingSpanIdx,
-    TimingSpanSet,
-};
+use crate::host::wasm_common::{err_to_errno_and_log, RowIterIdx, RowIters, TimingSpan, TimingSpanIdx, TimingSpanSet};
 use crate::host::AbiCall;
 use anyhow::Context as _;
 use spacetimedb_data_structures::map::IntMap;
-use spacetimedb_lib::Timestamp;
+use spacetimedb_lib::{ConnectionId, Timestamp};
 use spacetimedb_primitives::{errno, ColId};
+use std::future::Future;
+use std::num::NonZeroU32;
+use std::time::Instant;
 use wasmtime::{AsContext, Caller, StoreContextMut};
-
-use super::{Mem, MemView, NullableMemOp, WasmError, WasmPointee, WasmPtr};
-
-#[cfg(not(feature = "spacetimedb-wasm-instance-env-times"))]
-use instrumentation::noop as span;
-#[cfg(feature = "spacetimedb-wasm-instance-env-times")]
-use instrumentation::op as span;
 
 /// A stream of bytes which the WASM module can read from
 /// using [`WasmInstanceEnv::bytes_source_read`].
@@ -112,8 +103,8 @@ pub(super) struct WasmInstanceEnv {
     /// Track time spent in module-defined spans.
     timing_spans: TimingSpanSet,
 
-    /// The point in time the last reducer call started at.
-    reducer_start: Instant,
+    /// The point in time the last, or current, reducer or procedure call started at.
+    funcall_start: Instant,
 
     /// Track time spent in all wasm instance env calls (aka syscall time).
     ///
@@ -121,8 +112,9 @@ pub(super) struct WasmInstanceEnv {
     /// to this tracker.
     call_times: CallTimes,
 
-    /// The last, including current, reducer to be executed by this environment.
-    reducer_name: String,
+    /// The name of the last, including current, reducer or procedure to be executed by this environment.
+    funcall_name: String,
+
     /// A pool of unused allocated chunks that can be reused.
     // TODO(Centril): consider using this pool for `console_timer_start` and `bytes_sink_write`.
     chunk_pool: ChunkPool,
@@ -138,7 +130,7 @@ type RtResult<T> = anyhow::Result<T>;
 impl WasmInstanceEnv {
     /// Create a new `WasmEnstanceEnv` from the given `InstanceEnv`.
     pub fn new(instance_env: InstanceEnv) -> Self {
-        let reducer_start = Instant::now();
+        let funcall_start = Instant::now();
         Self {
             instance_env,
             mem: None,
@@ -147,9 +139,9 @@ impl WasmInstanceEnv {
             standard_bytes_sink: None,
             iters: Default::default(),
             timing_spans: Default::default(),
-            reducer_start,
+            funcall_start,
             call_times: CallTimes::new(),
-            reducer_name: String::from("<initializing>"),
+            funcall_name: String::from("<initializing>"),
             chunk_pool: <_>::default(),
         }
     }
@@ -228,48 +220,54 @@ impl WasmInstanceEnv {
         self.standard_bytes_sink.take().unwrap_or_default()
     }
 
-    /// Signal to this `WasmInstanceEnv` that a reducer call is beginning.
+    /// Signal to this `WasmInstanceEnv` that a reducer or procedure call is beginning.
     ///
-    /// Returns the handle used by reducers to read from `args`
-    /// as well as the handle used to write the error message, if any.
-    pub fn start_reducer(&mut self, name: &str, args: bytes::Bytes, ts: Timestamp) -> (BytesSourceId, u32) {
+    /// Returns the handle used by reducers and procedures to read from `args`
+    /// as well as the handle used to write the reducer error message or procedure return value.
+    pub fn start_funcall(&mut self, name: &str, args: bytes::Bytes, ts: Timestamp) -> (BytesSourceId, u32) {
+        // Create the output sink.
+        // Reducers which fail will write their error message here.
+        // Procedures will write their result here.
         let errors = self.setup_standard_bytes_sink();
 
         let args = self.create_bytes_source(args).unwrap();
 
-        self.reducer_start = Instant::now();
-        name.clone_into(&mut self.reducer_name);
-        self.instance_env.start_reducer(ts);
+        self.funcall_start = Instant::now();
+        name.clone_into(&mut self.funcall_name);
+        self.instance_env.start_funcall(ts);
 
         (args, errors)
     }
 
-    /// Returns the name of the most recent reducer to be run in this environment.
-    pub fn reducer_name(&self) -> &str {
-        &self.reducer_name
+    /// Returns the name of the most recent reducer or procedure to be run in this environment.
+    pub fn funcall_name(&self) -> &str {
+        &self.funcall_name
     }
 
-    /// Returns the name of the most recent reducer to be run in this environment,
-    /// or `None` if no reducer is actively being invoked.
+    /// Returns the name of the most recent reducer or procedure to be run in this environment,
+    /// or `None` if no reducer or procedure is actively being invoked.
     fn log_record_function(&self) -> Option<&str> {
-        let function = self.reducer_name();
+        let function = self.funcall_name();
         (!function.is_empty()).then_some(function)
     }
 
-    /// Returns the name of the most recent reducer to be run in this environment.
-    pub fn reducer_start(&self) -> Instant {
-        self.reducer_start
+    /// Returns the start time of the most recent reducer or procedure to be run in this environment.
+    pub fn funcall_start(&self) -> Instant {
+        self.funcall_start
     }
 
-    /// Signal to this `WasmInstanceEnv` that a reducer call is over.
-    /// This resets all of the state associated to a single reducer call,
-    /// and returns instrumentation records.
-    pub fn finish_reducer(&mut self) -> (ExecutionTimings, Vec<u8>) {
+    /// Signal to this `WasmInstanceEnv` that a reducer or procedure call is over.
+    ///
+    /// Returns time measurements which can be recorded as metrics,
+    /// and the errors written by the WASM code to the standard error sink.
+    ///
+    /// This resets the call times and clears the arguments source and error sink.
+    pub fn finish_funcall(&mut self) -> (ExecutionTimings, Vec<u8>) {
         // For the moment,
         // we only explicitly clear the source/sink buffers and the "syscall" times.
         // TODO: should we be clearing `iters` and/or `timing_spans`?
 
-        let total_duration = self.reducer_start.elapsed();
+        let total_duration = self.funcall_start.elapsed();
 
         // Taking the call times record also resets timings to 0s for the next call.
         let wasm_instance_env_call_times = self.call_times.take();
@@ -301,20 +299,11 @@ impl WasmInstanceEnv {
     }
 
     fn convert_wasm_result<T: From<u16>>(func: AbiCall, err: WasmError) -> RtResult<T> {
-        Err(match err {
-            WasmError::Db(err) => match err_to_errno(&err) {
-                Some(errno) => {
-                    log::debug!(
-                        "abi call to {func} returned an errno: {errno} ({})",
-                        errno::strerror(errno).unwrap_or("<unknown>")
-                    );
-                    return Ok(errno.get().into());
-                }
-                None => anyhow::Error::from(AbiRuntimeError { func, err }),
-            },
-            WasmError::BufferTooSmall => return Ok(errno::BUFFER_TOO_SMALL.get().into()),
-            WasmError::Wasm(err) => err,
-        })
+        match err {
+            WasmError::Db(err) => err_to_errno_and_log(func, err),
+            WasmError::BufferTooSmall => Ok(errno::BUFFER_TOO_SMALL.get().into()),
+            WasmError::Wasm(err) => Err(err),
+        }
     }
 
     /// Call the function `run` with the name `func`.
@@ -697,27 +686,12 @@ impl WasmInstanceEnv {
             // Read `buffer_len`, i.e., the capacity of `buffer` pointed to by `buffer_ptr`.
             let buffer_len = u32::read_from(mem, buffer_len_ptr)?;
             let write_buffer_len = |mem, len| u32::try_from(len).unwrap().write_to(mem, buffer_len_ptr);
+
             // Get a mutable view to the `buffer`.
-            let mut buffer = mem.deref_slice_mut(buffer_ptr, buffer_len)?;
+            let buffer = mem.deref_slice_mut(buffer_ptr, buffer_len)?;
 
-            let mut written = 0;
             // Fill the buffer as much as possible.
-            while let Some(chunk) = iter.as_slice().first() {
-                let Some((buf_chunk, rest)) = buffer.split_at_mut_checked(chunk.len()) else {
-                    // Cannot fit chunk into the buffer,
-                    // either because we already filled it too much,
-                    // or because it is too small.
-                    break;
-                };
-                buf_chunk.copy_from_slice(chunk);
-                written += chunk.len();
-                buffer = rest;
-
-                // Advance the iterator, as we used a chunk.
-                // SAFETY: We peeked one `chunk`, so there must be one at least.
-                let chunk = unsafe { iter.next().unwrap_unchecked() };
-                env.chunk_pool.put(chunk);
-            }
+            let written = InstanceEnv::fill_buffer_from_iter(iter, buffer, &mut env.chunk_pool);
 
             let ret = match (written, iter.as_slice().first()) {
                 // Nothing was written and the iterator is not exhausted.
@@ -1039,7 +1013,7 @@ impl WasmInstanceEnv {
             let args = mem.deref_slice(args, args_len)?;
             env.instance_env.scheduler.volatile_nonatomic_schedule_immediate(
                 name.to_owned(),
-                crate::host::ReducerArgs::Bsatn(args.to_vec().into()),
+                crate::host::FunctionArgs::Bsatn(args.to_vec().into()),
             );
 
             Ok(())
@@ -1289,8 +1263,7 @@ impl WasmInstanceEnv {
             let function = env.log_record_function();
 
             let record = Record {
-                // TODO: figure out whether to use walltime now or logical reducer now (env.reducer_start)
-                ts: chrono::Utc::now(),
+                ts: InstanceEnv::now_for_logging(),
                 target: target.as_deref(),
                 filename: filename.as_deref(),
                 line_number,
@@ -1332,25 +1305,51 @@ impl WasmInstanceEnv {
             let Some(span) = caller.data_mut().timing_spans.take(TimingSpanIdx(span_id)) else {
                 return Ok(errno::NO_SUCH_CONSOLE_TIMER.get().into());
             };
-
-            let elapsed = span.start.elapsed();
-            let message = format!("Timing span {:?}: {:?}", &span.name, elapsed);
             let function = caller.data().log_record_function();
-
-            let record = Record {
-                ts: chrono::Utc::now(),
-                target: None,
-                filename: None,
-                line_number: None,
-                function,
-                message: &message,
-            };
-            caller.data().instance_env.console_log(
-                crate::database_logger::LogLevel::Info,
-                &record,
-                &caller.as_context(),
-            );
+            caller.data().instance_env.console_timer_end(&span, function);
             Ok(0)
+        })
+    }
+
+    /// Finds the JWT payload associated with `connection_id`.
+    /// A `[ByteSourceId]` for the payload will be written to `target_ptr`.
+    /// If nothing is found for the connection, `[ByteSourceId::INVALID]` (zero) is written to `target_ptr`.
+    ///
+    /// This must be called inside a transaction (because it reads from a system table).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error:
+    ///
+    /// - `NOT_IN_TRANSACTION`, when called outside of a transaction.
+    ///
+    /// # Traps
+    ///
+    /// Traps if:
+    ///
+    /// - `connection_id` does not point to a valid little-endian `ConnectionId`.
+    /// - `target_ptr` is NULL or `target_ptr[..size_of::<u32>()]` is not in bounds of WASM memory.
+    ///  - The `ByteSourceId` to be written to `target_ptr` would overflow [`u32::MAX`].
+    pub fn get_jwt(
+        caller: Caller<'_, Self>,
+        connection_id: WasmPtr<ConnectionId>,
+        target_ptr: WasmPtr<u32>,
+    ) -> RtResult<u32> {
+        Self::cvt_ret(caller, AbiCall::GetJwt, target_ptr, |caller| {
+            let (mem, env) = Self::mem_env(caller);
+            let cid = ConnectionId::read_from(mem, connection_id)?;
+            let jwt = env.instance_env.get_jwt_payload(cid)?;
+            let jwt = match jwt {
+                None => {
+                    // We should consider logging a warning here, since we don't expect any
+                    // connection ids to not have a JWT after we migrate.
+                    return Ok(0u32);
+                }
+                Some(jwt) => jwt,
+            };
+            let b = bytes::Bytes::from(jwt);
+            let source_id = env.create_bytes_source(b)?;
+            Ok(source_id.0)
         })
     }
 
@@ -1366,13 +1365,60 @@ impl WasmInstanceEnv {
         // as we want to possibly trap, but not to return an error code.
         Self::with_span(caller, AbiCall::Identity, |caller| {
             let (mem, env) = Self::mem_env(caller);
-            let identity = env.instance_env.replica_ctx.database.database_identity;
+            let identity = env.instance_env.database_identity();
             // We're implicitly casting `out_ptr` to `WasmPtr<Identity>` here.
             // (Both types are actually `u32`.)
             // This works because `Identity::write_to` does not require an aligned pointer,
             // as it gets a `&mut [u8]` from WASM memory and does `copy_from_slice` with it.
             identity.write_to(mem, out_ptr)?;
             Ok(())
+        })
+    }
+
+    /// Suspends execution of this WASM instance until approximately `wake_at_micros_since_unix_epoch`.
+    ///
+    /// Returns immediately if `wake_at_micros_since_unix_epoch` is in the past.
+    ///
+    /// Upon resuming, returns the current timestamp as microseconds since the Unix epoch.
+    ///
+    /// Not particularly useful, except for testing SpacetimeDB internals related to suspending procedure execution.
+    ///
+    /// In our public module-facing interfaces, this function is marked as unstable.
+    ///
+    /// # Traps
+    ///
+    /// Traps if:
+    ///
+    /// - The calling WASM instance is holding open a transaction.
+    /// - The calling WASM instance is not executing a procedure.
+    // TODO(procedure-sleep-until): remove this
+    pub fn procedure_sleep_until<'caller>(
+        mut caller: Caller<'caller, Self>,
+        (wake_at_micros_since_unix_epoch,): (i64,),
+    ) -> Box<dyn Future<Output = i64> + Send + 'caller> {
+        Box::new(async move {
+            use std::time::SystemTime;
+            let span_start = span::CallSpanStart::new(AbiCall::ProcedureSleepUntil);
+
+            let get_current_time = || Timestamp::now().to_micros_since_unix_epoch();
+
+            if wake_at_micros_since_unix_epoch < 0 {
+                return get_current_time();
+            }
+
+            let wake_at = Timestamp::from_micros_since_unix_epoch(wake_at_micros_since_unix_epoch);
+            let Ok(duration) = SystemTime::from(wake_at).duration_since(SystemTime::now()) else {
+                return get_current_time();
+            };
+
+            tokio::time::sleep(duration).await;
+
+            let res = get_current_time();
+
+            let span = span_start.end();
+            span::record_span(&mut caller.data_mut().call_times, span);
+
+            res
         })
     }
 }

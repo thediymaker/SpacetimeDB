@@ -14,6 +14,7 @@ import {
   deepEqual as __deepEqual,
   type AlgebraicType as __AlgebraicTypeType,
   type AlgebraicTypeVariants as __AlgebraicTypeVariants,
+  type TableHandle as __TableHandle,
 } from '../../index';
 import { RawColumnDefaultValueV9 } from './raw_column_default_value_v_9_type';
 // Mark import as potentially unused
@@ -25,6 +26,8 @@ import * as RawMiscModuleExportV9Variants from './raw_misc_module_export_v_9_var
 export type RawMiscModuleExportV9 =
   RawMiscModuleExportV9Variants.ColumnDefaultValue;
 
+let _cached_RawMiscModuleExportV9_type_value: __AlgebraicTypeType | null = null;
+
 // A value with helper functions to construct the type.
 export const RawMiscModuleExportV9 = {
   // Helper functions for constructing each variant of the tagged union.
@@ -35,17 +38,22 @@ export const RawMiscModuleExportV9 = {
   // ```
   ColumnDefaultValue: (
     value: RawColumnDefaultValueV9
-  ): RawMiscModuleExportV9 => ({ tag: 'ColumnDefaultValue', value }),
+  ): RawMiscModuleExportV9Variants.ColumnDefaultValue => ({
+    tag: 'ColumnDefaultValue',
+    value,
+  }),
 
   getTypeScriptAlgebraicType(): __AlgebraicTypeType {
-    return __AlgebraicTypeValue.Sum({
-      variants: [
-        {
-          name: 'ColumnDefaultValue',
-          algebraicType: RawColumnDefaultValueV9.getTypeScriptAlgebraicType(),
-        },
-      ],
+    if (_cached_RawMiscModuleExportV9_type_value)
+      return _cached_RawMiscModuleExportV9_type_value;
+    _cached_RawMiscModuleExportV9_type_value = __AlgebraicTypeValue.Sum({
+      variants: [],
     });
+    _cached_RawMiscModuleExportV9_type_value.value.variants.push({
+      name: 'ColumnDefaultValue',
+      algebraicType: RawColumnDefaultValueV9.getTypeScriptAlgebraicType(),
+    });
+    return _cached_RawMiscModuleExportV9_type_value;
   },
 
   serialize(writer: __BinaryWriter, value: RawMiscModuleExportV9): void {
